@@ -44,6 +44,7 @@ SUBDIRS = \
 		pg_walinspect	\
 		postgres_fdw	\
 		seg		\
+		sjbloom		\
 		spi		\
 		tablefunc	\
 		tcn		\
