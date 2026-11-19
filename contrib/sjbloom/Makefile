@@ -12,13 +12,15 @@ MODULE_big = sjbloom
 OBJS = \
 	$(WIN32RES) \
 	bloom.o \
+	costmodel.o \
+	sjb_cost.o \
 	sjbloom.o
 
 EXTENSION = sjbloom
 DATA = sjbloom--1.0.sql
 PGFILEDESC = "sjbloom - semijoin filters for postgres_fdw"
 
-REGRESS = sjbloom_filter
+REGRESS = sjbloom_filter sjbloom_cost
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
@@ -31,7 +33,8 @@ include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
 
-# Make does not know that the .c files include sjb_filter.h. Without this
+# Make does not know that the .c files include sjb_filter.h and
+# costmodel.h. Without this
 # line, changing the header (for example SJB_VERSION) would not rebuild
 # them, and the library would silently keep the old values.
-$(OBJS): sjb_filter.h
+$(OBJS): sjb_filter.h costmodel.h
