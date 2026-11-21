@@ -19,6 +19,7 @@
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "libpq/libpq-be.h"
+#include "optimizer/planner.h"
 #include "postgres_fdw.h"
 #include "utils/guc.h"
 #include "utils/varlena.h"
@@ -49,6 +50,11 @@ static PQconninfoOption *libpq_options;
  * GUC parameters
  */
 char	   *pgfdw_application_name = NULL;
+
+
+// CS631 semijoin parameters (using in semijoin.c)
+bool pgfdw_enable_semijoin = true;
+bool pgfdw_semijoin_verbose = false;
 
 /*
  * Helper functions
@@ -126,7 +132,8 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
 			strcmp(def->defname, "parallel_commit") == 0 ||
 			strcmp(def->defname, "parallel_abort") == 0 ||
 			strcmp(def->defname, "keep_connections") == 0 ||
-			strcmp(def->defname, "use_scram_passthrough") == 0)
+			strcmp(def->defname, "use_scram_passthrough") == 0 ||
+			strcmp(def->defname, "semijoin_filter") == 0)
 		{
 			/* these accept only boolean values */
 			(void) defGetBoolean(def);
@@ -282,6 +289,10 @@ InitPgFdwOptions(void)
 
 		{"use_scram_passthrough", ForeignServerRelationId, false},
 		{"use_scram_passthrough", UserMappingRelationId, false},
+
+		
+		{"semijoin_filter", ForeignServerRelationId, false},
+		{"semijoin_filter", ForeignTableRelationId, false},
 
 		/*
 		 * sslcert and sslkey are in fact libpq options, but we repeat them
@@ -596,5 +607,33 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
+	
+	//CS631 semijoin settings
+
+	DefineCustomBoolVariable("postgres_fdw.enable_semijoin",
+							 "Enables the automatic semijoin rewrite of local-foreign joins.",
+							 NULL,
+							 &pgfdw_enable_semijoin,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("postgres_fdw.semijoin_verbose",
+							 "Prints a NOTICE explaining every semijoin decision.",
+							 NULL,
+							 &pgfdw_semijoin_verbose,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	MarkGUCPrefixReserved("postgres_fdw");
+
+	prev_planner_hook = planner_hook;
+	planner_hook = pgfdw_semijoin_planner;
 }

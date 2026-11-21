@@ -18,6 +18,7 @@
 #include "libpq-fe.h"
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/planner.h"
 #include "utils/relcache.h"
 
 /*
@@ -178,6 +179,10 @@ extern List *ExtractExtensionList(const char *extensionsString,
 extern char *process_pgfdw_appname(const char *appname);
 extern char *pgfdw_application_name;
 
+// CS631 semijoin settings defined in option.c 
+extern bool pgfdw_enable_semijoin;
+extern bool pgfdw_semijoin_verbose;
+
 /* in deparse.c */
 extern void classifyConditions(PlannerInfo *root,
 							   RelOptInfo *baserel,
@@ -252,6 +257,14 @@ extern void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root,
 									bool is_subquery,
 									List **retrieved_attrs, List **params_list);
 extern const char *get_jointype_name(JoinType jointype);
+
+//CS631
+extern planner_hook_type prev_planner_hook;
+
+extern PlannedStmt *pgfdw_semijoin_planner(Query *parse,
+										   const char *query_string,
+										   int cursorOptions,
+										   ParamListInfo boundParams);
 
 /* in shippable.c */
 extern bool is_builtin(Oid objectId);

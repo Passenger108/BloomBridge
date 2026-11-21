@@ -5,6 +5,7 @@ postgres_fdw_sources = files(
   'deparse.c',
   'option.c',
   'postgres_fdw.c',
+  'semijoin.c',
   'shippable.c',
 )
 
