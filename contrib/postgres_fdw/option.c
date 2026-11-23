@@ -52,9 +52,39 @@ static PQconninfoOption *libpq_options;
 char	   *pgfdw_application_name = NULL;
 
 
-// CS631 semijoin parameters (using in semijoin.c)
-bool pgfdw_enable_semijoin = true;
-bool pgfdw_semijoin_verbose = false;
+
+bool		pgfdw_enable_semijoin = true;
+int			pgfdw_semijoin_force_path = SEMIJOIN_PATH_AUTO;
+bool		pgfdw_semijoin_verbose = false;
+bool		pgfdw_semijoin_binary_filter = false;
+double		pgfdw_semijoin_network_mbit = 1000.0;
+int			pgfdw_semijoin_max_filter_kb = 1024;
+
+/* calibration.json: suggested.t_check_ns (one sjb_contains call at B) */
+double		pgfdw_semijoin_t_check_ns = 158.19;
+
+/* calibration.json: suggested.t_lookup_us (one index lookup, end to end) */
+double		pgfdw_semijoin_t_lookup_us = 4.7956;
+
+/* calibration.json: suggested.per_message_ms (one FETCH round trip) */
+double		pgfdw_semijoin_per_message_ms = 0.06194;
+
+/* calibration.json: suggested.per_row_us (handling one returned row) */
+double		pgfdw_semijoin_per_row_us = 0.54819;
+
+/* calibration.json: suggested.t_build_us (adding one key to a filter at A) */
+double		pgfdw_semijoin_t_build_us = 0.245;
+
+/*
+ * The allowed values of postgres_fdw.semijoin_force_path. Each entry is
+ * {name the user types, value stored in the C variable, hidden?}.
+ */
+static const struct config_enum_entry semijoin_force_path_options[] = {
+	{"auto", SEMIJOIN_PATH_AUTO, false},
+	{"index", SEMIJOIN_PATH_INDEX, false},
+	{"filter", SEMIJOIN_PATH_FILTER, false},
+	{NULL, 0, false}
+};
 
 /*
  * Helper functions
@@ -621,11 +651,126 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomEnumVariable("postgres_fdw.semijoin_force_path",
+							 "Forces the semijoin path: auto (cost model), index or filter.",
+							 "Meant for tests and demonstrations.",
+							 &pgfdw_semijoin_force_path,
+							 SEMIJOIN_PATH_AUTO,
+							 semijoin_force_path_options,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	DefineCustomBoolVariable("postgres_fdw.semijoin_verbose",
 							 "Prints a NOTICE explaining every semijoin decision.",
 							 NULL,
 							 &pgfdw_semijoin_verbose,
 							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("postgres_fdw.semijoin_binary_filter",
+							 "Sends bytea query parameters (such as the semijoin filter) in binary instead of hex text.",
+							 "Halves the bytes of the filter on the wire.",
+							 &pgfdw_semijoin_binary_filter,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomRealVariable("postgres_fdw.semijoin_network_mbit",
+							 "Network bandwidth between the two sites, in Mbit/s.",
+							 NULL,
+							 &pgfdw_semijoin_network_mbit,
+							 1000.0,
+							 0.001,
+							 1000000000.0,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/* GUC_UNIT_KB: the value is in kB, and users may write '2MB' etc. */
+	DefineCustomIntVariable("postgres_fdw.semijoin_max_filter_kb",
+							"Largest filter (Bloom or exact key list) that may be sent.",
+							NULL,
+							&pgfdw_semijoin_max_filter_kb,
+							1024,
+							0,
+							1048576,
+							PGC_USERSET,
+							GUC_UNIT_KB,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomRealVariable("postgres_fdw.semijoin_t_check_ns",
+							 "Time of one sjb_contains check at the remote site, in ns.",
+							 NULL,
+							 &pgfdw_semijoin_t_check_ns,
+							 158.19,
+							 0.0,
+							 1000000000.0,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomRealVariable("postgres_fdw.semijoin_t_lookup_us",
+							 "Time of one index lookup through postgres_fdw, in microseconds.",
+							 NULL,
+							 &pgfdw_semijoin_t_lookup_us,
+							 4.7956,
+							 0.0,
+							 1000000000.0,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomRealVariable("postgres_fdw.semijoin_per_message_ms",
+							 "Time of one FETCH round trip, in ms.",
+							 NULL,
+							 &pgfdw_semijoin_per_message_ms,
+							 0.06194,
+							 0.0,
+							 1000000000.0,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomRealVariable("postgres_fdw.semijoin_per_row_us",
+							 "Time to handle one returned row, in microseconds.",
+							 NULL,
+							 &pgfdw_semijoin_per_row_us,
+							 0.54819,
+							 0.0,
+							 1000000000.0,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomRealVariable("postgres_fdw.semijoin_t_build_us",
+							 "Time to add one key to a filter at the local site, in microseconds.",
+							 NULL,
+							 &pgfdw_semijoin_t_build_us,
+							 0.245,
+							 0.0,
+							 1000000000.0,
 							 PGC_USERSET,
 							 0,
 							 NULL,

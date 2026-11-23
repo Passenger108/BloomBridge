@@ -1,10 +1,10 @@
 #include "postgres.h"
-
 #include <math.h>
-
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
@@ -34,10 +34,14 @@
 
 #define SJB_ROW_OVERHEAD_BYTES 7
 #define SJB_COLUMN_OVERHEAD_BYTES 4
+#define SJB_WIRE_FACTOR_TEXT 2.0
+#define SJB_WIRE_FACTOR_BINARY 1.0
 
 #define SJB_DEFAULT_FETCH_SIZE 100
 
 planner_hook_type prev_planner_hook = NULL;
+
+SemijoinHint *pgfdw_semijoin_hint = NULL;
 
 static bool in_semijoin_hook = false;
 
@@ -64,6 +68,11 @@ typedef struct SjbCandidate
 	bool		always_report;
 
 	bool		uses_foreign_table;
+
+
+	Oid			contains_oid;
+
+	SemijoinHint hint;
 } SjbCandidate;
 
 typedef struct SjbStats
@@ -89,6 +98,9 @@ typedef struct TableRefs
 	bool		uses_other;
 } TableRefs;
 
+
+
+
 static void
 split_and_clauses(Node *node, List **clauses)
 {
@@ -107,6 +119,7 @@ split_and_clauses(Node *node, List **clauses)
 
 	*clauses = lappend(*clauses, node);
 }
+
 
 static bool
 collect_join_tree_quals(Node *node, List **clauses)
@@ -149,6 +162,8 @@ collect_join_tree_quals(Node *node, List **clauses)
 	return false;
 }
 
+
+
 static bool
 table_refs_walker(Node *node, TableRefs *refs)
 {
@@ -157,7 +172,7 @@ table_refs_walker(Node *node, TableRefs *refs)
 
 	if (IsA(node, Var))
 	{
-		Var		   *var = (Var *) node;
+		Var *var = (Var *) node;
 
 		if (var->varlevelsup != 0)
 			refs->uses_other = true;
@@ -190,7 +205,7 @@ contains_sjb_contains_walker(Node *node, void *context)
 		return false;
 	if (IsA(node, FuncExpr))
 	{
-		FuncExpr   *func = (FuncExpr *) node;
+		FuncExpr  *func = (FuncExpr *) node;
 		char	   *name = get_func_name(func->funcid);
 
 		if (name != NULL && strcmp(name, "sjb_contains") == 0)
@@ -198,6 +213,9 @@ contains_sjb_contains_walker(Node *node, void *context)
 	}
 	return expression_tree_walker(node, contains_sjb_contains_walker, context);
 }
+
+
+
 
 static bool
 is_join_clause(Node *clause, SjbCandidate *c, Var **local_var, Var **foreign_var)
@@ -231,6 +249,8 @@ is_join_clause(Node *clause, SjbCandidate *c, Var **local_var, Var **foreign_var
 	*foreign_var = right;
 	return true;
 }
+
+
 
 static DefElem *
 find_option(List *options, const char *name)
@@ -288,6 +308,8 @@ find_tables(Query *q, SjbCandidate *c)
 		}
 	}
 
+
+
 	if (num_relations != 2 || c->local_varno == 0 || c->foreign_varno == 0)
 	{
 		c->reject_reason = "the query does not join exactly one local table with one foreign table";
@@ -295,6 +317,8 @@ find_tables(Query *q, SjbCandidate *c)
 	}
 	return true;
 }
+
+
 
 static bool
 server_allows_semijoin(SjbCandidate *c)
@@ -334,6 +358,8 @@ server_allows_semijoin(SjbCandidate *c)
 	}
 	return true;
 }
+
+
 
 static bool
 check_conditions(Query *q, SjbCandidate *c)
@@ -591,6 +617,8 @@ collect_remote_stats(Query *q, SjbCandidate *c, SjbStats *stats)
 	}
 	stats->rows_per_key = stats->s_rows / stats->d_remote;
 
+
+
 	columns = foreign_columns_used(q, c);
 	stats->num_columns = 0;
 	member = -1;
@@ -612,6 +640,8 @@ collect_remote_stats(Query *q, SjbCandidate *c, SjbStats *stats)
 	stats->fetch_size = get_fetch_size(c);
 	return true;
 }
+
+
 
 static char *
 local_key_text(SjbCandidate *c)
@@ -652,6 +682,8 @@ build_local_select(SjbCandidate *c, const char *select_list)
 	}
 	return sql.data;
 }
+
+
 
 static Query *
 parse_select(const char *sql)
@@ -695,6 +727,156 @@ estimate_local_keys(SjbCandidate *c, SjbStats *stats)
 	stats->n_est = Max(stats->n_est, 1);
 }
 
+
+
+
+static int64
+get_max_filter_bytes(void)
+{
+	return (int64) pgfdw_semijoin_max_filter_kb * 1024;
+}
+
+
+
+
+static double
+get_wire_factor(void)
+{
+	if (pgfdw_semijoin_binary_filter)
+		return SJB_WIRE_FACTOR_BINARY;
+	return SJB_WIRE_FACTOR_TEXT;
+}
+
+
+
+
+static bool
+invoke_cost_function(SjbCandidate *c, const char *function_name,
+					 SjbStats *stats, const char *path, Datum *result)
+{
+	Oid			argument_types[14];
+	int			num_arguments = (path == NULL) ? 13 : 14;
+	int			wire_factor_argument = num_arguments - 1;	
+	Oid			function_oid;
+	FmgrInfo	function_info;
+	int			i;
+
+
+	LOCAL_FCINFO(fcinfo, 14);
+
+	for (i = 0; i < 10; i++)
+		argument_types[i] = FLOAT8OID;
+	argument_types[10] = INT4OID;	
+	argument_types[11] = INT8OID;	
+	argument_types[12] = TEXTOID;	
+	argument_types[wire_factor_argument] = FLOAT8OID;	
+
+	function_oid = LookupFuncName(list_make2(makeString(c->sjbloom_schema),
+											 makeString(pstrdup(function_name))),
+								  num_arguments, argument_types, true);
+	if (!OidIsValid(function_oid))
+		return false;
+
+
+	fmgr_info(function_oid, &function_info);
+	InitFunctionCallInfoData(*fcinfo, &function_info, num_arguments,
+							 InvalidOid, NULL, NULL);
+
+
+	fcinfo->args[0].value = Float8GetDatum(stats->n_est);
+	fcinfo->args[1].value = Float8GetDatum(stats->s_rows);
+	fcinfo->args[2].value = Float8GetDatum(stats->rows_per_key);
+	fcinfo->args[3].value = Float8GetDatum(stats->row_width);
+	fcinfo->args[4].value = Float8GetDatum(pgfdw_semijoin_network_mbit);
+	fcinfo->args[5].value = Float8GetDatum(pgfdw_semijoin_t_check_ns);
+	fcinfo->args[6].value = Float8GetDatum(pgfdw_semijoin_t_lookup_us);
+	fcinfo->args[7].value = Float8GetDatum(pgfdw_semijoin_per_message_ms);
+	fcinfo->args[8].value = Float8GetDatum(pgfdw_semijoin_per_row_us);
+	fcinfo->args[9].value = Float8GetDatum(pgfdw_semijoin_t_build_us);
+	fcinfo->args[10].value = Int32GetDatum(stats->fetch_size);
+	fcinfo->args[11].value = Int64GetDatum(get_max_filter_bytes());
+	if (path != NULL)
+		fcinfo->args[12].value = CStringGetTextDatum(path);	/* C string -> text */
+	fcinfo->args[wire_factor_argument].value = Float8GetDatum(get_wire_factor());
+	for (i = 0; i < num_arguments; i++)
+		fcinfo->args[i].isnull = false;
+
+	*result = FunctionCallInvoke(fcinfo);
+	return !fcinfo->isnull;
+}
+
+
+
+static char *
+call_cost_function(SjbCandidate *c, const char *function_name, SjbStats *stats)
+{
+	Datum		result;
+
+	if (!invoke_cost_function(c, function_name, stats, NULL, &result))
+		return NULL;
+	return text_to_cstring(DatumGetTextPP(result));
+}
+
+
+
+static bool
+call_cost_number(SjbCandidate *c, const char *function_name, SjbStats *stats,
+				 const char *path, double *value)
+{
+	Datum		result;
+
+	if (!invoke_cost_function(c, function_name, stats, path, &result))
+		return false;
+	*value = DatumGetFloat8(result);	
+	return true;
+}
+
+
+static bool
+fill_hint(SjbCandidate *c, SjbStats *stats, int path)
+{
+	SemijoinHint hint;
+	const char *path_name = (path == SEMIJOIN_PATH_INDEX) ? "index" : "filter";
+
+	memset(&hint, 0, sizeof(hint));
+	hint.foreign_relid = c->foreign_relid;
+	hint.foreign_attno = c->foreign_attno;
+	hint.contains_funcid = c->contains_oid;	/* InvalidOid on the index path */
+	hint.path = path;
+	hint.n_est = stats->n_est;
+
+	if (!call_cost_number(c, "sjb_expected_remote_rows", stats, path_name, &hint.expected_rows) ||
+		!call_cost_number(c, "sjb_predicted_ms", stats, "index", &hint.index_ms) ||
+		!call_cost_number(c, "sjb_predicted_ms", stats, "filter", &hint.filter_ms))
+		return false;
+
+	c->hint = hint;
+	return true;
+}
+
+
+
+static int
+decide_path(SjbCandidate *c, SjbStats *stats)
+{
+	char	   *choice;
+
+	if (pgfdw_semijoin_force_path == SEMIJOIN_PATH_INDEX ||
+		pgfdw_semijoin_force_path == SEMIJOIN_PATH_FILTER)
+		return pgfdw_semijoin_force_path;
+
+	choice = call_cost_function(c, "sjb_plan_choice", stats);
+	if (choice != NULL && strcmp(choice, "index") == 0)
+		return SEMIJOIN_PATH_INDEX;
+	if (choice != NULL && strcmp(choice, "filter") == 0)
+		return SEMIJOIN_PATH_FILTER;
+
+	c->reject_reason = "sjb_plan_choice(13 arguments) could not be called: recreate sjbloom from its current SQL file";
+	return -1;
+}
+
+
+
 static Node *
 make_expr_sublink(Query *subquery)
 {
@@ -723,21 +905,84 @@ build_index_condition(SjbCandidate *c, char **sql)
 	return (Node *) any_expr;
 }
 
-static void
-report_rewrite(SjbStats *stats, const char *sql)
+
+
+static Node *
+build_filter_condition(SjbCandidate *c, SjbStats *stats, char **sql)
 {
+	Oid			contains_argument_types[2] = {BYTEAOID, INT4OID};
+	Oid			contains_oid;
+	long long	max_filter_bytes = (long long) get_max_filter_bytes();
+	char	   *build_call;
+	Node	   *sublink;
+
+	contains_oid = LookupFuncName(list_make2(makeString(c->sjbloom_schema),
+											 makeString("sjb_contains")),
+								  2, contains_argument_types, true);
+	if (!OidIsValid(contains_oid))
+	{
+		c->reject_reason = "function sjb_contains(bytea, int4) not found";
+		return NULL;
+	}
+	c->contains_oid = contains_oid;
+
+
+	build_call = psprintf("%s.sjb_build_auto(array_agg(%s), "
+						  "%.17g::float8, %.17g::float8, %.17g::float8, "
+						  "%.17g::float8, %.17g::float8, %lld::int8, "
+						  "%.17g::float8, %.17g::float8, %.17g::float8, "
+						  "%.17g::float8, %d::int4)",
+						  quote_identifier(c->sjbloom_schema),
+						  local_key_text(c),
+						  stats->s_rows,
+						  stats->rows_per_key,
+						  stats->row_width,
+						  pgfdw_semijoin_network_mbit,
+						  pgfdw_semijoin_t_check_ns,
+						  max_filter_bytes,
+						  get_wire_factor(),
+						  pgfdw_semijoin_per_message_ms,
+						  pgfdw_semijoin_per_row_us,
+						  pgfdw_semijoin_t_build_us,
+						  stats->fetch_size);
+	*sql = build_local_select(c, build_call);
+	sublink = make_expr_sublink(parse_select(*sql));
+
+	return (Node *) makeFuncExpr(contains_oid, BOOLOID,
+								 list_make2(sublink, copyObject(c->foreign_var)),
+								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+}
+
+
+
+static void
+report_decision(SjbCandidate *c, SjbStats *stats, int path, const char *sql)
+{
+	char	   *report = call_cost_function(c, "sjb_choice_report", stats);
+	char	   *winner_line = NULL;
+
+	if (report != NULL)
+		winner_line = strstr(report, "winner:");
+
 	ereport(NOTICE,
-			(errmsg("postgres_fdw semijoin: index path: n_est=%.1f (r=%.0f, N=%.0f, D_local=%.0f), s_rows=%.0f, rows_per_key=%.3f, row_width=%.2f (%d columns), fetch_size=%d",
+			(errmsg("postgres_fdw semijoin: %s path (%s): n_est=%.1f (r=%.0f, N=%.0f, D_local=%.0f), s_rows=%.0f, rows_per_key=%.3f, row_width=%.2f (%d columns), fetch_size=%d, max_filter_bytes=%lld",
+					path == SEMIJOIN_PATH_INDEX ? "index" : "filter",
+					pgfdw_semijoin_force_path == SEMIJOIN_PATH_AUTO ? "cost model" : "forced",
 					stats->n_est, stats->r_local, stats->n_local, stats->d_local,
 					stats->s_rows, stats->rows_per_key, stats->row_width,
-					stats->num_columns, stats->fetch_size),
-			 errdetail("sub-SELECT: %s", sql)));
+					stats->num_columns, stats->fetch_size,
+					(long long) get_max_filter_bytes()),
+			 errdetail("cost model %s\nexpected remote rows: %.1f (index %.3f ms, filter %.3f ms)\nsub-SELECT: %s",
+					   winner_line != NULL ? winner_line : "report not available",
+					   c->hint.expected_rows, c->hint.index_ms, c->hint.filter_ms,
+					   sql)));
 }
 
 static Node *
 plan_semijoin(Query *q, SjbCandidate *c)
 {
 	SjbStats	stats;
+	int			path;
 	Node	   *condition;
 	char	   *sql = NULL;
 
@@ -753,12 +998,24 @@ plan_semijoin(Query *q, SjbCandidate *c)
 		return NULL;
 	estimate_local_keys(c, &stats);
 
-	condition = build_index_condition(c, &sql);
+	path = decide_path(c, &stats);
+	if (path == SEMIJOIN_PATH_INDEX)
+		condition = build_index_condition(c, &sql);
+	else if (path == SEMIJOIN_PATH_FILTER)
+		condition = build_filter_condition(c, &stats, &sql);
+	else
+		return NULL;
 
+	if (condition == NULL)
+		return NULL;
+
+	fill_hint(c, &stats, path);
 	if (pgfdw_semijoin_verbose)
-		report_rewrite(&stats, sql);
+		report_decision(c, &stats, path, sql);
 	return condition;
 }
+
+
 
 static Node *
 try_plan_semijoin(Query *q, SjbCandidate *c)
@@ -816,6 +1073,14 @@ PlannedStmt *
 pgfdw_semijoin_planner(Query *parse, const char *query_string,
 					   int cursorOptions, ParamListInfo boundParams)
 {
+	SemijoinHint my_hint;
+	SemijoinHint *saved_hint = pgfdw_semijoin_hint;
+	PlannedStmt *result;
+
+	/* no hint unless this query is rewritten below */
+	memset(&my_hint, 0, sizeof(my_hint));
+	my_hint.foreign_relid = InvalidOid;
+
 	if (pgfdw_enable_semijoin && !in_semijoin_hook && !IsInParallelMode())
 	{
 		SjbCandidate candidate;
@@ -828,7 +1093,10 @@ pgfdw_semijoin_planner(Query *parse, const char *query_string,
 				condition = try_plan_semijoin(parse, &candidate);
 
 			if (condition != NULL)
+			{
+				my_hint = candidate.hint;	/* may be empty: see fill_hint */
 				attach_condition(parse, condition);
+			}
 			else if (candidate.uses_foreign_table &&
 					 (pgfdw_semijoin_verbose || candidate.always_report))
 				ereport(NOTICE,
@@ -842,7 +1110,21 @@ pgfdw_semijoin_planner(Query *parse, const char *query_string,
 		PG_END_TRY();
 	}
 
-	if (prev_planner_hook != NULL)
-		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
-	return standard_planner(parse, query_string, cursorOptions, boundParams);
+
+	
+	pgfdw_semijoin_hint = OidIsValid(my_hint.foreign_relid) ? &my_hint : NULL;
+	PG_TRY();
+	{
+		if (prev_planner_hook != NULL)
+			result = prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+		else
+			result = standard_planner(parse, query_string, cursorOptions, boundParams);
+	}
+	PG_FINALLY();
+	{
+		pgfdw_semijoin_hint = saved_hint;
+	}
+	PG_END_TRY();
+
+	return result;
 }

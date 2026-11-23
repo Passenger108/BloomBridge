@@ -84,6 +84,13 @@ enum FdwScanPrivateIndex
 	 * of join, added when the scan is join
 	 */
 	FdwScanPrivateRelations,
+
+	/*
+	 * CS631: List with our semijoin decision (see pgfdw_semijoin_plan_info),
+	 * added only for a scan rewritten by our hook. For a plain table scan,
+	 * FdwScanPrivateRelations is then a NULL placeholder.
+	 */
+	FdwScanPrivateSemijoin,
 };
 
 /*
@@ -162,6 +169,15 @@ typedef struct PgFdwScanState
 	int			num_tuples;		/* # of tuples in array */
 	int			next_tuple;		/* index of next one to return */
 
+	/*
+	 * CS631 Batch 7: with postgres_fdw.semijoin_binary_filter on, bytea
+	 * parameters are sent in binary. param_formats[i] = 1 for those (0 =
+	 * text), param_lengths[i] = their length. Both NULL if all parameters
+	 * are text, exactly as before.
+	 */
+	int		   *param_formats;
+	int		   *param_lengths;
+
 	/* batch-level state, for optimizing rewinds and avoiding useless fetch */
 	int			fetch_ct_2;		/* Min(# of fetches done, 2) */
 	bool		eof_reached;	/* true if last fetch reached EOF */
@@ -174,6 +190,11 @@ typedef struct PgFdwScanState
 	MemoryContext temp_cxt;		/* context for per-tuple temporary data */
 
 	int			fetch_size;		/* number of tuples per fetch */
+
+	/* CS631: semijoin info from fdw_private (NIL if not rewritten) */
+	List	   *semijoin_info;
+	int			semijoin_param_index;	/* which param is our filter/list */
+	SemijoinRuntime semijoin_runtime;	/* what was really sent */
 } PgFdwScanState;
 
 /*
@@ -501,7 +522,9 @@ static void prepare_query_params(PlanState *node,
 static void process_query_params(ExprContext *econtext,
 								 FmgrInfo *param_flinfo,
 								 List *param_exprs,
-								 const char **param_values);
+								 const char **param_values,
+								 const int *param_formats,
+								 int *param_lengths);
 static int	postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 										  HeapTuple *rows, int targrows,
 										  double *totalrows,
@@ -766,6 +789,9 @@ postgresGetForeignRelSize(PlannerInfo *root,
 
 		/* Estimate baserel size as best we can with local statistics. */
 		set_baserel_size_estimates(root, baserel);
+
+		/* CS631: use the semijoin hook's expected rows for a rewritten scan */
+		pgfdw_apply_semijoin_hint(root, baserel, foreigntableid);
 
 		/* Fill in basically-bogus cost estimates for use later. */
 		estimate_path_cost_size(root, baserel, NIL, NIL, NULL,
@@ -1425,6 +1451,25 @@ postgresGetForeignPlan(PlannerInfo *root,
 							  makeString(fpinfo->relation_name));
 
 	/*
+	 * CS631: if our semijoin hook rewrote this scan, add its decision for
+	 * EXPLAIN. A plain table scan has no Relations item, so put a NULL
+	 * placeholder there first: existing positions stay where they are.
+	 */
+	if (IS_SIMPLE_REL(foreignrel))
+	{
+		List	   *semijoin_info = pgfdw_semijoin_plan_info(root, foreignrel,
+															 fpinfo->remote_conds,
+															 params_list);
+
+		if (semijoin_info != NIL)
+		{
+			if (list_length(fdw_private) == FdwScanPrivateRelations)
+				fdw_private = lappend(fdw_private, NULL);
+			fdw_private = lappend(fdw_private, semijoin_info);
+		}
+	}
+
+	/*
 	 * Create the ForeignScan node for the given relation.
 	 *
 	 * Note that the remote parameter expressions are stored in the fdw_exprs
@@ -1554,6 +1599,17 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->fetch_size = intVal(list_nth(fsplan->fdw_private,
 										  FdwScanPrivateFetchSize));
 
+	/* CS631: our semijoin decision, if this scan was rewritten */
+	fsstate->semijoin_info = NIL;
+	fsstate->semijoin_param_index = -1;
+	if (list_length(fsplan->fdw_private) > FdwScanPrivateSemijoin)
+	{
+		fsstate->semijoin_info = (List *) list_nth(fsplan->fdw_private,
+												   FdwScanPrivateSemijoin);
+		fsstate->semijoin_param_index =
+			pgfdw_semijoin_info_param_index(fsstate->semijoin_info);
+	}
+
 	/* Create contexts for batches of tuples and per-tuple temp workspace. */
 	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											   "postgres_fdw tuple data",
@@ -1591,6 +1647,32 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 							 &fsstate->param_flinfo,
 							 &fsstate->param_exprs,
 							 &fsstate->param_values);
+
+	/*
+	 * CS631: with postgres_fdw.semijoin_binary_filter on, send every bytea
+	 * parameter in binary (format code 1) instead of hex text.
+	 */
+	fsstate->param_formats = NULL;
+	fsstate->param_lengths = NULL;
+	if (numParams > 0 && pgfdw_semijoin_binary_filter)
+	{
+		ListCell   *lc;
+		int			i = 0;
+
+		foreach(lc, fsplan->fdw_exprs)
+		{
+			if (exprType((Node *) lfirst(lc)) == BYTEAOID)
+			{
+				if (fsstate->param_formats == NULL)
+				{
+					fsstate->param_formats = (int *) palloc0(numParams * sizeof(int));
+					fsstate->param_lengths = (int *) palloc0(numParams * sizeof(int));
+				}
+				fsstate->param_formats[i] = 1;
+			}
+			i++;
+		}
+	}
 
 	/* Set the async-capable flag */
 	fsstate->async_capable = node->ss.ps.async_capable;
@@ -2856,7 +2938,8 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	 * We do that here, not when the plan is created, because we can't know
 	 * what aliases ruleutils.c will assign at plan creation time.
 	 */
-	if (list_length(fdw_private) > FdwScanPrivateRelations)
+	if (list_length(fdw_private) > FdwScanPrivateRelations &&
+		list_nth(fdw_private, FdwScanPrivateRelations) != NULL)	/* CS631 */
 	{
 		StringInfo	relations;
 		char	   *rawrelations;
@@ -2943,6 +3026,16 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 		sql = strVal(list_nth(fdw_private, FdwScanPrivateSelectSql));
 		ExplainPropertyText("Remote SQL", sql, es);
+	}
+
+	/* CS631: our semijoin decision, and with ANALYZE what was sent */
+	if (list_length(fdw_private) > FdwScanPrivateSemijoin)
+	{
+		PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
+
+		pgfdw_semijoin_explain((List *) list_nth(fdw_private, FdwScanPrivateSemijoin),
+							   fsstate != NULL ? &fsstate->semijoin_runtime : NULL,
+							   es);
 	}
 }
 
@@ -3769,7 +3862,29 @@ create_cursor(ForeignScanState *node)
 		process_query_params(econtext,
 							 fsstate->param_flinfo,
 							 fsstate->param_exprs,
-							 values);
+							 values,
+							 fsstate->param_formats,
+							 fsstate->param_lengths);
+
+		/*
+		 * CS631: remember what our semijoin parameter looks like, for
+		 * EXPLAIN ANALYZE. Done now, because the values live in short-lived
+		 * memory.
+		 */
+		if (fsstate->semijoin_info != NIL &&
+			fsstate->semijoin_param_index >= 0 &&
+			fsstate->semijoin_param_index < numParams)
+		{
+			int			index = fsstate->semijoin_param_index;
+			bool		binary = (fsstate->param_formats != NULL &&
+								  fsstate->param_formats[index] == 1);
+
+			pgfdw_semijoin_decode_param(values[index],
+										binary ? fsstate->param_lengths[index] : -1,
+										binary,
+										pgfdw_semijoin_info_path(fsstate->semijoin_info),
+										&fsstate->semijoin_runtime);
+		}
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -3787,7 +3902,10 @@ create_cursor(ForeignScanState *node)
 	 * server has the same OIDs we do for the parameters' types.
 	 */
 	if (!PQsendQueryParams(conn, buf.data, numParams,
-						   NULL, values, NULL, NULL, 0))
+						   NULL, values,
+						   fsstate->param_lengths,	/* CS631: NULL unless */
+						   fsstate->param_formats,	/* binary bytea params */
+						   0))
 		pgfdw_report_error(ERROR, NULL, conn, false, buf.data);
 
 	/*
@@ -4588,7 +4706,9 @@ execute_dml_stmt(ForeignScanState *node)
 		process_query_params(econtext,
 							 dmstate->param_flinfo,
 							 dmstate->param_exprs,
-							 values);
+							 values,
+							 NULL,
+							 NULL);
 
 	/*
 	 * Notice that we pass NULL for paramTypes, thus forcing the remote server
@@ -4902,12 +5022,18 @@ prepare_query_params(PlanState *node,
 
 /*
  * Construct array of query parameter values in text format.
+ *
+ * CS631: if param_formats is not NULL, a parameter with param_formats[i]
+ * = 1 is a bytea sent in binary: its raw bytes go into param_values[i]
+ * and their number into param_lengths[i].
  */
 static void
 process_query_params(ExprContext *econtext,
 					 FmgrInfo *param_flinfo,
 					 List *param_exprs,
-					 const char **param_values)
+					 const char **param_values,
+					 const int *param_formats,
+					 int *param_lengths)
 {
 	int			nestlevel;
 	int			i;
@@ -4931,6 +5057,14 @@ process_query_params(ExprContext *econtext,
 		 */
 		if (isNull)
 			param_values[i] = NULL;
+		else if (param_formats != NULL && param_formats[i] == 1)
+		{
+			/* CS631: binary bytea; DatumGetByteaPP also detoasts it */
+			bytea	   *raw = DatumGetByteaPP(expr_value);
+
+			param_values[i] = VARDATA_ANY(raw);
+			param_lengths[i] = VARSIZE_ANY_EXHDR(raw);
+		}
 		else
 			param_values[i] = OutputFunctionCall(&param_flinfo[i], expr_value);
 

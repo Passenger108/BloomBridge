@@ -1,15 +1,3 @@
-/*-------------------------------------------------------------------------
- *
- * postgres_fdw.h
- *		  Foreign-data wrapper for remote PostgreSQL servers
- *
- * Portions Copyright (c) 2012-2025, PostgreSQL Global Development Group
- *
- * IDENTIFICATION
- *		  contrib/postgres_fdw/postgres_fdw.h
- *
- *-------------------------------------------------------------------------
- */
 #ifndef POSTGRES_FDW_H
 #define POSTGRES_FDW_H
 
@@ -21,197 +9,154 @@
 #include "optimizer/planner.h"
 #include "utils/relcache.h"
 
-/*
- * FDW-specific planner information kept in RelOptInfo.fdw_private for a
- * postgres_fdw foreign table.  For a baserel, this struct is created by
- * postgresGetForeignRelSize, although some fields are not filled till later.
- * postgresGetForeignJoinPaths creates it for a joinrel, and
- * postgresGetForeignUpperPaths creates it for an upperrel.
- */
+
 typedef struct PgFdwRelationInfo
 {
-	/*
-	 * True means that the relation can be pushed down. Always true for simple
-	 * foreign scan.
-	 */
-	bool		pushdown_safe;
 
-	/*
-	 * Restriction clauses, divided into safe and unsafe to pushdown subsets.
-	 * All entries in these lists should have RestrictInfo wrappers; that
-	 * improves efficiency of selectivity and cost estimation.
-	 */
+	bool		pushdown_safe;
 	List	   *remote_conds;
 	List	   *local_conds;
-
-	/* Actual remote restriction clauses for scan (sans RestrictInfos) */
 	List	   *final_remote_exprs;
-
-	/* Bitmap of attr numbers we need to fetch from the remote server. */
 	Bitmapset  *attrs_used;
-
-	/* True means that the query_pathkeys is safe to push down */
 	bool		qp_is_pushdown_safe;
-
-	/* Cost and selectivity of local_conds. */
 	QualCost	local_conds_cost;
 	Selectivity local_conds_sel;
-
-	/* Selectivity of join conditions */
 	Selectivity joinclause_sel;
-
-	/* Estimated size and cost for a scan, join, or grouping/aggregation. */
 	double		rows;
 	int			width;
 	int			disabled_nodes;
 	Cost		startup_cost;
 	Cost		total_cost;
-
-	/*
-	 * Estimated number of rows fetched from the foreign server, and costs
-	 * excluding costs for transferring those rows from the foreign server.
-	 * These are only used by estimate_path_cost_size().
-	 */
 	double		retrieved_rows;
 	Cost		rel_startup_cost;
 	Cost		rel_total_cost;
-
-	/* Options extracted from catalogs. */
 	bool		use_remote_estimate;
 	Cost		fdw_startup_cost;
 	Cost		fdw_tuple_cost;
-	List	   *shippable_extensions;	/* OIDs of shippable extensions */
+	List	   *shippable_extensions;
 	bool		async_capable;
-
-	/* Cached catalog information. */
 	ForeignTable *table;
 	ForeignServer *server;
-	UserMapping *user;			/* only set in use_remote_estimate mode */
-
-	int			fetch_size;		/* fetch size for this remote table */
-
-	/*
-	 * Name of the relation, for use while EXPLAINing ForeignScan.  It is used
-	 * for join and upper relations but is set for all relations.  For a base
-	 * relation, this is really just the RT index as a string; we convert that
-	 * while producing EXPLAIN output.  For join and upper relations, the name
-	 * indicates which base foreign tables are included and the join type or
-	 * aggregation type used.
-	 */
+	UserMapping *user;			
+	int			fetch_size;	
 	char	   *relation_name;
-
-	/* Join information */
 	RelOptInfo *outerrel;
 	RelOptInfo *innerrel;
 	JoinType	jointype;
-	/* joinclauses contains only JOIN/ON conditions for an outer join */
-	List	   *joinclauses;	/* List of RestrictInfo */
+	List	   *joinclauses;	
 
-	/* Upper relation information */
 	UpperRelationKind stage;
 
-	/* Grouping information */
 	List	   *grouped_tlist;
 
-	/* Subquery information */
-	bool		make_outerrel_subquery; /* do we deparse outerrel as a
-										 * subquery? */
-	bool		make_innerrel_subquery; /* do we deparse innerrel as a
-										 * subquery? */
-	Relids		lower_subquery_rels;	/* all relids appearing in lower
-										 * subqueries */
-	Relids		hidden_subquery_rels;	/* relids, which can't be referred to
-										 * from upper relations, used
-										 * internally for equivalence member
-										 * search */
 
-	/*
-	 * Index of the relation.  It is used to create an alias to a subquery
-	 * representing the relation.
-	 */
+	bool		make_outerrel_subquery; 
+	bool		make_innerrel_subquery; 
+	Relids		lower_subquery_rels;	
+	Relids		hidden_subquery_rels;	
+
 	int			relation_index;
 } PgFdwRelationInfo;
 
-/*
- * Extra control information relating to a connection.
- */
+
+
 typedef struct PgFdwConnState
 {
-	AsyncRequest *pendingAreq;	/* pending async request */
+	AsyncRequest *pendingAreq;
 } PgFdwConnState;
 
-/*
- * Method used by ANALYZE to sample remote rows.
- */
+
+
 typedef enum PgFdwSamplingMethod
 {
-	ANALYZE_SAMPLE_OFF,			/* no remote sampling */
-	ANALYZE_SAMPLE_AUTO,		/* choose by server version */
-	ANALYZE_SAMPLE_RANDOM,		/* remote random() */
-	ANALYZE_SAMPLE_SYSTEM,		/* TABLESAMPLE system */
-	ANALYZE_SAMPLE_BERNOULLI,	/* TABLESAMPLE bernoulli */
+	ANALYZE_SAMPLE_OFF,			
+	ANALYZE_SAMPLE_AUTO,		
+	ANALYZE_SAMPLE_RANDOM,		
+	ANALYZE_SAMPLE_SYSTEM,		
+	ANALYZE_SAMPLE_BERNOULLI,	
 } PgFdwSamplingMethod;
 
-/* in postgres_fdw.c */
+
 extern int	set_transmission_modes(void);
 extern void reset_transmission_modes(int nestlevel);
 extern void process_pending_request(AsyncRequest *areq);
 
-/* in connection.c */
-extern PGconn *GetConnection(UserMapping *user, bool will_prep_stmt,
-							 PgFdwConnState **state);
+
+extern PGconn *GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state);
 extern void ReleaseConnection(PGconn *conn);
 extern unsigned int GetCursorNumber(PGconn *conn);
 extern unsigned int GetPrepStmtNumber(PGconn *conn);
 extern void do_sql_command(PGconn *conn, const char *sql);
 extern PGresult *pgfdw_get_result(PGconn *conn);
-extern PGresult *pgfdw_exec_query(PGconn *conn, const char *query,
-								  PgFdwConnState *state);
-extern void pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
-							   bool clear, const char *sql);
+extern PGresult *pgfdw_exec_query(PGconn *conn, const char *query, PgFdwConnState *state);
+extern void pgfdw_report_error(int elevel, PGresult *res, PGconn *conn, bool clear, const char *sql);
 
-/* in option.c */
+
 extern int	ExtractConnectionOptions(List *defelems,
 									 const char **keywords,
 									 const char **values);
-extern List *ExtractExtensionList(const char *extensionsString,
-								  bool warnOnMissing);
+extern List *ExtractExtensionList(const char *extensionsString, bool warnOnMissing);
 extern char *process_pgfdw_appname(const char *appname);
 extern char *pgfdw_application_name;
 
-// CS631 semijoin settings defined in option.c 
-extern bool pgfdw_enable_semijoin;
-extern bool pgfdw_semijoin_verbose;
 
-/* in deparse.c */
+#define SEMIJOIN_PATH_AUTO		0	
+#define SEMIJOIN_PATH_INDEX		1	
+#define SEMIJOIN_PATH_FILTER	2	
+
+extern bool pgfdw_enable_semijoin;
+extern int	pgfdw_semijoin_force_path;
+extern bool pgfdw_semijoin_verbose;
+extern bool pgfdw_semijoin_binary_filter;
+extern double pgfdw_semijoin_network_mbit;
+extern int	pgfdw_semijoin_max_filter_kb;
+extern double pgfdw_semijoin_t_check_ns;
+extern double pgfdw_semijoin_t_lookup_us;
+extern double pgfdw_semijoin_per_message_ms;
+extern double pgfdw_semijoin_per_row_us;
+extern double pgfdw_semijoin_t_build_us;
+
+
 extern void classifyConditions(PlannerInfo *root,
 							   RelOptInfo *baserel,
 							   List *input_conds,
 							   List **remote_conds,
 							   List **local_conds);
+
+							
 extern bool is_foreign_expr(PlannerInfo *root,
 							RelOptInfo *baserel,
 							Expr *expr);
+
 extern bool is_foreign_param(PlannerInfo *root,
 							 RelOptInfo *baserel,
 							 Expr *expr);
+
+
 extern bool is_foreign_pathkey(PlannerInfo *root,
 							   RelOptInfo *baserel,
 							   PathKey *pathkey);
+
 extern void deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
 							 Index rtindex, Relation rel,
 							 List *targetAttrs, bool doNothing,
 							 List *withCheckOptionList, List *returningList,
 							 List **retrieved_attrs, int *values_end_len);
+
+
 extern void rebuildInsertSql(StringInfo buf, Relation rel,
 							 char *orig_query, List *target_attrs,
 							 int values_end_len, int num_params,
 							 int num_rows);
+
+
 extern void deparseUpdateSql(StringInfo buf, RangeTblEntry *rte,
 							 Index rtindex, Relation rel,
 							 List *targetAttrs,
 							 List *withCheckOptionList, List *returningList,
 							 List **retrieved_attrs);
+
+							 
 extern void deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 								   Index rtindex, Relation rel,
 								   RelOptInfo *foreignrel,
@@ -221,10 +166,13 @@ extern void deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 								   List **params_list,
 								   List *returningList,
 								   List **retrieved_attrs);
+
+
 extern void deparseDeleteSql(StringInfo buf, RangeTblEntry *rte,
 							 Index rtindex, Relation rel,
 							 List *returningList,
 							 List **retrieved_attrs);
+
 extern void deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 								   Index rtindex, Relation rel,
 								   RelOptInfo *foreignrel,
@@ -232,23 +180,24 @@ extern void deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 								   List **params_list,
 								   List *returningList,
 								   List **retrieved_attrs);
+
 extern void deparseAnalyzeSizeSql(StringInfo buf, Relation rel);
 extern void deparseAnalyzeInfoSql(StringInfo buf, Relation rel);
 extern void deparseAnalyzeSql(StringInfo buf, Relation rel,
 							  PgFdwSamplingMethod sample_method,
 							  double sample_frac,
 							  List **retrieved_attrs);
-extern void deparseTruncateSql(StringInfo buf,
-							   List *rels,
-							   DropBehavior behavior,
-							   bool restart_seqs);
+
+extern void deparseTruncateSql(StringInfo buf, List *rels, DropBehavior behavior, bool restart_seqs);
 extern void deparseStringLiteral(StringInfo buf, const char *val);
 extern EquivalenceMember *find_em_for_rel(PlannerInfo *root,
 										  EquivalenceClass *ec,
 										  RelOptInfo *rel);
+
 extern EquivalenceMember *find_em_for_rel_target(PlannerInfo *root,
 												 EquivalenceClass *ec,
 												 RelOptInfo *rel);
+
 extern List *build_tlist_to_deparse(RelOptInfo *foreignrel);
 extern void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root,
 									RelOptInfo *rel, List *tlist,
@@ -256,18 +205,56 @@ extern void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root,
 									bool has_final_sort, bool has_limit,
 									bool is_subquery,
 									List **retrieved_attrs, List **params_list);
+
+
 extern const char *get_jointype_name(JoinType jointype);
 
-//CS631
+
 extern planner_hook_type prev_planner_hook;
+
+
+typedef struct SemijoinHint
+{
+	Oid			foreign_relid;	
+	AttrNumber	foreign_attno;	
+	Oid			contains_funcid;	
+	int			path;			
+	double		expected_rows;	
+	double		n_est;			
+	double		index_ms;		
+	double		filter_ms;		
+} SemijoinHint;
+
+extern SemijoinHint *pgfdw_semijoin_hint;
+extern void pgfdw_apply_semijoin_hint(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid);
+
+
+typedef struct SemijoinRuntime
+{
+	bool		decoded;		
+	char		description[160];	
+} SemijoinRuntime;
+
+struct ExplainState;			
+
+extern List *pgfdw_semijoin_plan_info(PlannerInfo *root, RelOptInfo *foreignrel,
+									  List *remote_conds, List *params_list);
+extern int	pgfdw_semijoin_info_path(List *info);
+extern int	pgfdw_semijoin_info_param_index(List *info);
+extern void pgfdw_semijoin_decode_param(const char *value, int length,
+										bool binary, int path,
+										SemijoinRuntime *runtime);
+
+extern void pgfdw_semijoin_explain(List *info, SemijoinRuntime *runtime,
+								   struct ExplainState *es);
 
 extern PlannedStmt *pgfdw_semijoin_planner(Query *parse,
 										   const char *query_string,
 										   int cursorOptions,
 										   ParamListInfo boundParams);
 
-/* in shippable.c */
+
 extern bool is_builtin(Oid objectId);
 extern bool is_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo);
 
-#endif							/* POSTGRES_FDW_H */
+#endif							

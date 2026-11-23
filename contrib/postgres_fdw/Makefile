@@ -8,6 +8,7 @@ OBJS = \
 	option.o \
 	postgres_fdw.o \
 	semijoin.o \
+	semijoin_explain.o \
 	shippable.o
 PGFILEDESC = "postgres_fdw - foreign data wrapper for PostgreSQL"
 
